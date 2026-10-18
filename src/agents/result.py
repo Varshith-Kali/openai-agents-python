@@ -1056,6 +1056,7 @@ class RunResultStreaming(RunResultBase):
 
         register_current_consumer()
         cancelled = False
+        aborted = False
         try:
             while True:
                 register_current_consumer()
@@ -1101,6 +1102,13 @@ class RunResultStreaming(RunResultBase):
                 item_acknowledgement_pending = True
                 try:
                     yield item
+                except BaseException:
+                    # The consumer raised while handling this event, or the consumer task was
+                    # cancelled outside the queue wait: the run must stop rather than continue
+                    # unattended. Set the flag before re-raising so the outer finally branch
+                    # cancels instead of awaiting the run loop to completion.
+                    aborted = True
+                    raise
                 finally:
                     acknowledge_item()
         finally:
@@ -1109,9 +1117,15 @@ class RunResultStreaming(RunResultBase):
             unregister_consumer()
             try:
                 try:
-                    if cancelled:
-                        # Queue-wait cancellation should return without awaiting long-running tasks.
-                        # Tasks have already been cancelled above.
+                    if cancelled or aborted:
+                        # Queue-wait cancellation or an abnormal consumer exit (exception thrown
+                        # into the generator while handling a yielded event, or the consumer task
+                        # cancelled outside the queue wait): stop the run instead of awaiting it
+                        # to completion, so no further model calls or tool executions happen
+                        # with no consumer reading them. In the cancelled case the run was
+                        # already cancelled when the queue wait was interrupted.
+                        if aborted:
+                            self.cancel()
                         self._cleanup_tasks()
                     else:
                         # Ensure main execution completes before cleanup to avoid race conditions

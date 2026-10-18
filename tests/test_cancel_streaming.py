@@ -2,6 +2,7 @@ import asyncio
 import gc
 import json
 import time
+from typing import Any
 
 import pytest
 from openai.types.responses import ResponseCompletedEvent
@@ -598,3 +599,115 @@ async def test_terminal_consumer_cancellation_waits_for_registered_cleanup(
         await asyncio.gather(consumer, cleanup_waiter, result.run_loop_task, return_exceptions=True)
         await result._await_model_provider_cleanup()
         await result._run_sandbox_cleanup()
+
+
+def _make_counting_tool_model(tool_calls: list[int]) -> tuple[ScriptedModel, Any]:
+    """Build a ScriptedModel with many tool-call turns and a tool that counts executions."""
+    from agents import function_tool
+
+    def _counting_tool() -> str:
+        tool_calls.append(1)
+        return "tool_result"
+
+    counting_tool = function_tool(
+        _counting_tool, name_override="counting_tool", failure_error_function=None
+    )
+    model = ScriptedModel()
+    model.extend(
+        [get_text_message("thinking"), get_function_tool_call("counting_tool", json.dumps({}))]
+        for _ in range(10)
+    )
+    model.extend([[get_text_message("done")]])
+    return model, counting_tool
+
+
+@pytest.mark.asyncio
+async def test_raise_in_consumer_body_stops_run() -> None:
+    """Raising while handling a yielded event must cancel the run (issue #5386).
+
+    The #2222 fix only covers cancellation while parked on the event-queue get. An
+    exception thrown into the generator at the yield point must stop the run as well,
+    instead of letting remaining model turns and tool executions continue unattended.
+    """
+    from agents.items import ToolCallOutputItem
+
+    tool_calls: list[int] = []
+    model, counting_tool = _make_counting_tool_model(tool_calls)
+    result = Runner.run_streamed(
+        Agent(name="A", model=model, tools=[counting_tool]),
+        input="go",
+    )
+    try:
+        with pytest.raises(RuntimeError, match="boom"):
+            async for event in result.stream_events():
+                if isinstance(getattr(event, "item", None), ToolCallOutputItem):
+                    raise RuntimeError("boom")
+        stopped_tool_calls = len(tool_calls)
+        stopped_model_calls = len(model.calls)
+        # Give the run loop a chance to keep going if the fix regresses.
+        await asyncio.sleep(0.5)
+        assert result.run_loop_task is not None
+        assert result.run_loop_task.cancelled(), "run loop must be cancelled after consumer abort"
+        assert len(tool_calls) == stopped_tool_calls, (
+            f"tool executions continued after the consumer aborted: "
+            f"{stopped_tool_calls} -> {len(tool_calls)}"
+        )
+        assert len(model.calls) == stopped_model_calls, (
+            f"model calls continued after the consumer aborted: "
+            f"{stopped_model_calls} -> {len(model.calls)}"
+        )
+    finally:
+        result.cancel()
+        assert result.run_loop_task is not None
+        await asyncio.gather(result.run_loop_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_consumer_cancelled_while_handling_event_stops_run() -> None:
+    """Cancelling the consumer task while it handles an event must cancel the run.
+
+    Mirrors the aclosing() path of issue #5386: the abandoned generator is closed
+    (GeneratorExit at the yield point), which must stop the run rather than await it
+    to completion.
+    """
+    tool_calls: list[int] = []
+    model, counting_tool = _make_counting_tool_model(tool_calls)
+    result = Runner.run_streamed(
+        Agent(name="A", model=model, tools=[counting_tool]),
+        input="go",
+    )
+    gen = result.stream_events()
+    handling = asyncio.Event()
+
+    async def consume() -> None:
+        async for _ in gen:
+            handling.set()
+            # Suspended while handling an event, not parked on the queue get.
+            await asyncio.Event().wait()
+
+    consumer = asyncio.create_task(consume())
+    try:
+        await asyncio.wait_for(handling.wait(), timeout=2)
+        consumer.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(consumer, timeout=2)
+        # Close the abandoned generator, as aclosing() or the asyncgen finalizer would.
+        await asyncio.wait_for(gen.aclose(), timeout=2)
+        stopped_tool_calls = len(tool_calls)
+        stopped_model_calls = len(model.calls)
+        # Give the run loop a chance to keep going if the fix regresses.
+        await asyncio.sleep(0.5)
+        assert result.run_loop_task is not None
+        assert result.run_loop_task.cancelled(), "run loop must be cancelled after consumer abort"
+        assert len(tool_calls) == stopped_tool_calls, (
+            f"tool executions continued after the consumer was cancelled: "
+            f"{stopped_tool_calls} -> {len(tool_calls)}"
+        )
+        assert len(model.calls) == stopped_model_calls, (
+            f"model calls continued after the consumer was cancelled: "
+            f"{stopped_model_calls} -> {len(model.calls)}"
+        )
+    finally:
+        result.cancel()
+        assert result.run_loop_task is not None
+        await asyncio.gather(consumer, result.run_loop_task, return_exceptions=True)
